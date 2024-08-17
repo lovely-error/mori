@@ -1,11 +1,9 @@
 
 use core::{mem::{align_of, size_of}, ptr::addr_of_mut, sync::atomic::AtomicUsize};
-use std::{cell::UnsafeCell, os::raw::c_int, ptr::null_mut, sync::atomic::Ordering};
+use std::{cell::UnsafeCell, ptr::null_mut, sync::atomic::Ordering};
 
 use crate::utils::{Block4KPtr, PageSource};
-use libc::{
-  self, MAP_ANONYMOUS, MAP_HUGETLB, MAP_HUGE_2MB, MAP_POPULATE, MAP_PRIVATE, PROT_READ, PROT_WRITE
-};
+use libc;
 
 macro_rules! static_assert {
     ($cond:expr) => {
@@ -38,39 +36,15 @@ pub struct RootAllocator(UnsafeCell<RootAllocatorInner>);
 struct RootAllocatorInner {
   super_page: *mut Superpage,
   index: AtomicUsize,
-  huge_pages_enabled: bool,
 }
 impl RootAllocator {
   fn inner(&self) -> &mut RootAllocatorInner {
     unsafe { &mut*self.0.get() }
   }
-  fn alloc_superpage(&self) -> Result<*mut Superpage, AllocationFailure> {
-    let this = self.inner();
-    let attrs: c_int = if this.huge_pages_enabled {
-      MAP_HUGE_2MB | MAP_HUGETLB
-    } else {
-      0
-    };
-    let mut mem;
+  fn alloc_superpage() -> Result<*mut Superpage, AllocationFailure> {
+    let mut mem = null_mut();
     let out;
     unsafe {
-      mem = libc::mmap64(
-          null_mut(),
-          PAGE_2MB_SIZE,
-          PROT_READ | PROT_WRITE,
-          attrs | MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE,
-          -1,
-          0);
-      if mem == libc::MAP_FAILED {
-        let err = match *libc::__errno_location() {
-          libc::EPERM |
-          libc::ENODEV |
-          libc::ENFILE |
-          libc::ENOMEM => AllocationFailure::NoMem,
-          _ => unreachable!()
-        };
-        return Err(err);
-      }
       out = libc::posix_memalign(&mut mem, PAGE_2MB_ALIGN, PAGE_2MB_SIZE);
     };
     if out != 0 {
@@ -79,15 +53,10 @@ impl RootAllocator {
     return Ok(mem.cast())
   }
   pub fn new() -> Self {
-    let enable_huge = match std::env::var("HUGE_PAGES") {
-      Ok(str) if str == "1" => true,
-      _ => false,
-    };
     Self(
       UnsafeCell::new(RootAllocatorInner {
         super_page: null_mut(),
         index: AtomicUsize::new(SMALL_PAGE_LIMIT << 1),
-        huge_pages_enabled: enable_huge
       })
     )
   }
@@ -106,7 +75,7 @@ impl RootAllocator {
         return Err(AllocationFailure::WouldRetry);
       }
       else { // we gotta provide new page
-        let page = match self.alloc_superpage() {
+        let page = match Self::alloc_superpage() {
             Ok(mem) => mem,
             Err(err) => {
               this.index.fetch_and((!0) << 1, Ordering::Relaxed);
